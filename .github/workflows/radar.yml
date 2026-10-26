@@ -23,7 +23,7 @@ jobs:
           WATCHLIST: ${{ secrets.WATCHLIST }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
-        run: python radar.py
+        run: python .github/workflows/radar.py
       - name: Save state
         run: |
           git config user.name "radar"
