@@ -20,6 +20,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
+          LEAGUE_ID: ${{ secrets.LEAGUE_ID }}
           WATCHLIST: ${{ secrets.WATCHLIST }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
