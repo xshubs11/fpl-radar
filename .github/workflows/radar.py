@@ -7,9 +7,11 @@ E = os.environ
 TG_TOKEN = E["TG_TOKEN"]
 TG_CHAT = E["TG_CHAT_ID"]
 TEAM_ID = E.get("TEAM_ID", "")
+LEAGUE_ID = E.get("LEAGUE_ID", "")
 WATCH = [w.strip().lower() for w in (E.get("WATCHLIST") or "").split(",") if w.strip()]
 GKEY = E.get("GEMINI_API_KEY", "")
 GMODEL = E.get("GEMINI_MODEL") or "gemini-flash-latest"
+GCAP = int(E.get("GEMINI_DAILY_CAP") or 12)
 MANUAL = E.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 FPL = "https://fantasy.premierleague.com/api/"
 UA = {"User-Agent": "Mozilla/5.0 (compatible; fpl-radar/1.0)"}
@@ -114,11 +116,13 @@ def feed(url):
     return out
 
 
-def gemini(prompt):
+def gemini(prompt, search=False):
     url = "https://generativelanguage.googleapis.com/v1beta/models/" + GMODEL + ":generateContent"
-    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    if search:
+        payload["tools"] = [{"google_search": {}}]
     h = {"Content-Type": "application/json", "x-goog-api-key": GKEY, "User-Agent": "fpl-radar"}
-    r = http(url, data=body, headers=h, timeout=90)
+    r = http(url, data=json.dumps(payload).encode(), headers=h, timeout=120)
     parts = r["candidates"][0]["content"]["parts"]
     return "".join(p.get("text", "") for p in parts if not p.get("thought"))
 
@@ -127,12 +131,13 @@ try:
     S = json.load(open("state.json"))
 except Exception:
     S = {}
-for k, v in (("p", {}), ("seen", []), ("dl", []), ("fx", {}), ("recent", [])):
+for k, v in (("p", {}), ("seen", []), ("dl", []), ("fx", {}), ("recent", []), ("gem", {"d": "", "n": 0})):
     S.setdefault(k, v)
 first = "boot" not in S
 
-# Telegram commands
+# Telegram commands and questions
 want = set()
+questions = []
 try:
     ur = http("https://api.telegram.org/bot" + TG_TOKEN + "/getUpdates?timeout=0&offset=" + str(S.get("tg_offset", 0)))
     for u in ur.get("result", []):
@@ -140,17 +145,28 @@ try:
         m = u.get("message") or {}
         if str((m.get("chat") or {}).get("id")) != str(TG_CHAT):
             continue
-        c = (m.get("text") or "").strip().lower()
+        raw = (m.get("text") or "").strip()
+        c = raw.lower()
         if c.startswith(("/buy", "/transfer", "/suggest", "/ideas")):
             want.add("ideas")
         elif c.startswith(("/lineup", "/team", "/captain", "/xi")):
             want.add("lineup")
         elif c.startswith("/predict"):
             want.add("predict")
+        elif c.startswith("/risk"):
+            want.add("risk")
+        elif c.startswith(("/rivals", "/league")):
+            want.add("rivals")
         elif c.startswith("/status"):
             want.add("status")
+        elif c.startswith("/ask"):
+            q = re.sub(r"^/ask(@\w+)?\s*", "", raw, flags=re.I)
+            if q:
+                questions.append(q)
         elif c.startswith(("/help", "/start")):
             want.add("help")
+        elif raw and not c.startswith("/") and len(raw) > 3:
+            questions.append(raw)
 except Exception as e:
     print("updates error:", e)
 
@@ -472,6 +488,115 @@ def pressure():
     return ("💰 Price pressure (not a guarantee): " + ", ".join(out)) if out else ""
 
 
+def risk():
+    if not squad or not nxt:
+        return "⚠️ Couldn't read your squad. Check TEAM_ID."
+    recent = " ".join(S["recent"]).lower()
+    rows = []
+    for i in squad:
+        p = players[i]
+        pts = 0.0
+        why = []
+        if p["status"] != "a" or p.get("chance_of_playing_next_round") not in (None, 100):
+            pts += 3 if p["status"] in ("i", "s", "u", "n") else 2
+            why.append("flag " + flag(p) + (": " + p["news"] if p.get("news") else ""))
+        h = hist(i)
+        if h and h["start"] < 0.6:
+            pts += 2
+            why.append("rotation: started " + str(int(round(h["start"] * 5))) + "/5 recent")
+        elif h and h["start"] < 0.8:
+            pts += 1
+            why.append("minutes not guaranteed")
+        fl = fixl.get(p["team"], [])[:2]
+        if fl and sum(d for _, d, _, _ in fl) / float(len(fl)) >= 4:
+            pts += 1.5
+            why.append("tough fixtures " + fxt(p["team"]))
+        yc = p.get("yellow_cards", 0)
+        if (nid < 19 and yc == 4) or (19 <= nid < 32 and yc == 9) or (32 <= nid < 37 and yc == 14):
+            pts += 2
+            why.append("one yellow from a ban")
+        if p["web_name"].lower() in recent:
+            pts += 1
+            why.append("in recent headlines")
+        if pts >= 1.5:
+            rows.append((pts, i, why))
+    rows.sort(reverse=True)
+    tot = sum(r[0] for r in rows)
+    level = "HIGH" if tot >= 10 else ("MEDIUM" if tot >= 5 else "LOW")
+    lines = ["⚠️ TEAM RISK REPORT: overall " + level]
+    for pts, i, why in rows[:6]:
+        lines.append("• " + players[i]["web_name"] + " (" + team[players[i]["team"]] + ") risk "
+                     + str(round(pts, 1)) + ": " + "; ".join(why))
+    if not rows:
+        lines.append("No major risks found.")
+    for t, c in sqcnt.items():
+        if c == 3:
+            lines.append("• Club concentration: 3 players from " + tname[t] + " (one bad result hurts)")
+    return "\n".join(lines)
+
+
+def rivals():
+    if not LEAGUE_ID:
+        return "⚔️ Add your mini-league ID as a secret named LEAGUE_ID (the number in the league page address)."
+    if not cur:
+        return "⚔️ Season data not ready."
+    try:
+        st = http(FPL + "leagues-classic/" + LEAGUE_ID + "/standings/")["standings"]["results"]
+    except Exception as e:
+        return "⚔️ Couldn't read the league: " + str(e)[:100]
+    me = next((r for r in st if str(r["entry"]) == str(TEAM_ID)), None)
+    others = [r for r in st if str(r["entry"]) != str(TEAM_ID)][:7]
+    lines = ["⚔️ MINI-LEAGUE (captains and chips are last gameweek's)"]
+    if me and others:
+        gap = me["total"] - max(o["total"] for o in others)
+        lines.append("You: " + str(me["total"]) + " pts, rank " + str(me["rank"]) + " | "
+                     + ("lead +" if gap >= 0 else "behind ") + str(abs(gap)) + " on best rival")
+        if gap > 40:
+            lines.append("Plan: protect. Mirror the rivals' captain and avoid big hits.")
+        elif gap >= 0:
+            lines.append("Plan: stay flexible. One differential is fine.")
+        else:
+            lines.append("Plan: chase. You need differentials and a strong captain.")
+    caps = {}
+    for o in others:
+        eid = str(o["entry"])
+        sq_o, cap, chip, outs, ins, moves = set(), None, None, [], [], []
+        try:
+            r = http(FPL + "entry/" + eid + "/event/" + str(cur["id"]) + "/picks/")
+            sq_o = {x["element"] for x in r["picks"]}
+            cap = next((x["element"] for x in r["picks"] if x.get("is_captain")), None)
+            chip = r.get("active_chip")
+        except Exception as e:
+            print("rival picks error:", e)
+        try:
+            for t in http(FPL + "entry/" + eid + "/transfers/"):
+                if nxt and t["event"] == nid:
+                    outs.append(t["element_out"])
+                    ins.append(t["element_in"])
+                    moves.append(players[t["element_out"]]["web_name"] + ">" + players[t["element_in"]]["web_name"])
+        except Exception as e:
+            print("rival transfers error:", e)
+        sq_o = (sq_o - set(outs)) | set(ins)
+        if cap in players:
+            caps[cap] = caps.get(cap, 0) + 1
+        um = sorted(squad - sq_o, key=lambda i: -xp(i))[:3]
+        ut = sorted(sq_o - squad, key=lambda i: -xp(i))[:3]
+        line = str(o["rank"]) + ". " + o["player_name"] + " " + str(o["total"])
+        if cap in players:
+            line += " | C " + players[cap]["web_name"]
+        if chip:
+            line += " | chip " + chip
+        if moves:
+            line += "\n   moves: " + ", ".join(moves[:3])
+        line += ("\n   only you: " + ", ".join(players[i]["web_name"] for i in um)) if um else ""
+        line += ("\n   only them: " + ", ".join(players[i]["web_name"] for i in ut)) if ut else ""
+        lines.append(line)
+        time.sleep(0.3)
+    if caps:
+        lines.append("Rival captains: " + ", ".join(players[c]["web_name"] + " x" + str(n) for c, n in caps.items()))
+    return "\n".join(lines)
+
+
 dl = P(nxt["deadline_time"]) if nxt else None
 hrs = (dl - now).total_seconds() / 3600 if dl else 999
 soon = [1 for f in fixt if f.get("kickoff_time") and not f.get("finished")
@@ -623,6 +748,7 @@ if nxt and dl and hrs > 0:
                 pr = pressure()
                 if pr:
                     alerts.append(pr)
+                alerts.append(risk())
                 if GKEY and mk == 3:
                     try:
                         prompt = ("You are an FPL assistant. Using ONLY the data below, in under 120 words: say "
@@ -673,16 +799,74 @@ if not first:
             alerts.append(fxline(ev, v))
 S["fx"] = fx
 
+# ---------- Personal AI analyst (/ask or plain text) ----------
+CTX = {}
+
+
+def get_ctx(q):
+    if "base" not in CTX:
+        names = ["", "GK", "DEF", "MID", "FWD"]
+        sq = []
+        for i in sorted(squad, key=lambda i: (players[i]["element_type"], -players[i]["now_cost"])):
+            p = players[i]
+            sq.append(p["web_name"] + " " + names[p["element_type"]] + " " + team[p["team"]] + " £"
+                      + str(p["now_cost"] / 10) + " flag " + flag(p)
+                      + ((" news: " + p["news"]) if p.get("news") else "")
+                      + " xP " + str(round(xp(i, True), 1)) + " fixtures " + fxt(p["team"]))
+        CTX["base"] = ("GW" + str(nid) + ", deadline in " + str(round(hrs)) + "h. Bank £" + str(round(bank / 10, 1))
+                       + ".\nMY SQUAD:\n" + "\n".join(sq) + "\n\n" + lineup() + "\n\n" + risk() + "\n\n" + ideas()
+                       + "\n\nRECENT HEADLINES:\n" + "\n".join(S["recent"][-25:]) + "\n\nDGW/BGW: " + " ".join(fxlines))
+    c = CTX["base"]
+    if LEAGUE_ID and re.search(r"rival|league|friend|mini|bet|mirror|differential|captain", q, re.I):
+        if "riv" not in CTX:
+            CTX["riv"] = rivals()
+        c += "\n\n" + CTX["riv"]
+    return c[:9000]
+
+
+def ask(q):
+    g = S["gem"]
+    if g.get("d") != today:
+        g["d"], g["n"] = today, 0
+    if not GKEY:
+        return "🤖 Add the GEMINI_API_KEY secret to enable questions."
+    if g["n"] >= GCAP:
+        return "🤖 Daily AI question limit reached (" + str(GCAP) + "). Try tomorrow or use the Gemini app."
+    g["n"] += 1
+    persona = ("You are my personal FPL analyst and you track my team. I am an experienced, risk-tolerant manager: "
+               "I use hits and chips when justified and follow top FPL YouTubers and X for news. My goals: "
+               "(1) win my 4-friend mini-league (there is a bet) and (2) climb my overall rank. ")
+    prompt = (persona + "Answer using the DATA first (official FPL data and news feeds gathered by my radar bot). "
+              "You may use Google Search for fresh news; label claims CONFIRMED / LIKELY / RUMOUR and never invent news. "
+              "Give a clear recommendation with your confidence and what would change your mind. Under 200 words.\n\n"
+              "DATA:\n" + get_ctx(q) + "\n\nQUESTION: " + q)
+    try:
+        return "🤖 " + gemini(prompt, True).strip()
+    except Exception as e:
+        print("gemini search error:", e)
+    try:
+        return "🤖 " + gemini(prompt).strip()
+    except Exception as e:
+        return "🤖 Gemini error: " + str(e)[:150]
+
+
 # Replies to your commands
 if "help" in want:
-    alerts.append("Commands:\n/lineup (best XI, captain, vice, bench)\n/buy (transfer ideas)\n/predict (top predicted "
-                  "scorers)\n/status\n/help\nI reply on my next run (about 10-15 min). Predictions are model estimates.")
+    alerts.append("Commands:\n/lineup (XI, captain, vice, bench)\n/buy (transfer ideas)\n/predict (top predicted "
+                  "scorers)\n/risk (team risk report)\n/rivals (mini-league)\n/ask or just type a question\n/status\n"
+                  "I reply on my next run (about 10-15 min). Predictions are model estimates.")
 if "lineup" in want:
     alerts.append(lineup())
 if "ideas" in want:
     alerts.append(ideas())
 if "predict" in want:
     alerts.append(predict())
+if "risk" in want:
+    alerts.append(risk())
+if "rivals" in want:
+    alerts.append(rivals())
+for q in questions[:2]:
+    alerts.append("❓ " + q[:100] + "\n\n" + ask(q))
 if "status" in want or MANUAL:
     alerts.append("✅ Radar OK. Tracking " + str(len(mine)) + " players, squad " + str(len(squad)) + ", bank £"
                   + str(round(bank / 10, 1)) + ". Deadline in " + str(round(hrs)) + "h."
@@ -694,6 +878,6 @@ if first:
     S["boot"] = now.isoformat()
     tg("✅ FPL Radar online. Tracking " + str(len(mine)) + " players. Deadline in " + str(round(hrs)) + "h.\n"
        + "\n".join(fxlines[:6]))
-for a in alerts[:14]:
+for a in alerts[:16]:
     tg(a)
 json.dump(S, open("state.json", "w"))
